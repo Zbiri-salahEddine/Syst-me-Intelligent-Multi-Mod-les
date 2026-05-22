@@ -1,0 +1,17 @@
+__pycache__/
+*.pyc
+*.pyo
+.ipynb_checkpoints/
+.venv/
+venv/
+env/
+.env
+*.pkl
+*.joblib
+*.h5
+.DS_Store
+.vscode/
+.idea/
+.claude/
+*.npy
+~$*

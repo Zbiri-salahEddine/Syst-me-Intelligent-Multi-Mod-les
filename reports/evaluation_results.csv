@@ -1,0 +1,5 @@
+Model,MAE_train,MAE_test,RMSE_train,RMSE_test,R2_train,R2_test,MAPE_test_%,Gap_R2,Verdict
+XGBoost,2.357,2.502,3.543,3.538,0.9986,0.9985,1.84,0.0,OK
+Random Forest,1.692,2.634,2.761,3.701,0.9991,0.9984,1.9,0.0007,OVERFITTING
+Linear Regression,2.718,2.586,6.529,5.879,0.9951,0.996,1.87,-0.0009,OK
+MLP (Deep Learning),2.972,2.877,6.557,5.983,0.995,0.9958,2.26,-0.0008,OK
