@@ -143,6 +143,16 @@ print(results_df.to_string(index=False))
 results_df.to_csv(REPORTS_PATH / "evaluation_results.csv", index=False)
 print(f"\nResultats sauvegardes : {REPORTS_PATH / 'evaluation_results.csv'}")
 
+# Sauvegarde des predictions sur le test set (1 colonne par modele + verite terrain).
+# Le dashboard lit ce CSV pour le nuage "predictions vs reel" : il n'a donc PAS
+# besoin de recharger les 4 modeles (architecture Front / API / Modele respectee,
+# le dashboard ne manipule aucun artefact .joblib).
+test_predictions = pd.DataFrame({"y_true": y_test.reset_index(drop=True)})
+for name, preds in all_predictions.items():
+    test_predictions[name] = preds["y_test_pred"]
+test_predictions.to_csv(REPORTS_PATH / "test_predictions.csv", index=False)
+print(f"Predictions test sauvegardees : {REPORTS_PATH / 'test_predictions.csv'}")
+
 
 # %% 4. Visualisation : Predictions vs Realite (4 modeles)
 fig, axes = plt.subplots(2, 2, figsize=(14, 12))

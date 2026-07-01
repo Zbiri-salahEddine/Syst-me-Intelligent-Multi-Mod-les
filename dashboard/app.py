@@ -3,19 +3,30 @@ Dashboard Streamlit - Optimisation du ROI Marketing
 ====================================================
 Cible utilisateur : CMO / Responsable Marketing / Direction Financiere.
 
-Lancement :
-    cd "Projet Data Science"
-    streamlit run dashboard/app.py
+Architecture Front / API / Modele :
+    Ce dashboard ne charge JAMAIS le modele directement. Toutes les predictions
+    (simulation budgetaire + explication SHAP) sont obtenues en appelant l'API
+    REST FastAPI, ce qui reproduit une architecture de production realiste.
+    Les vues analytiques (EDA, comparaison de modeles) lisent uniquement des
+    artefacts pre-calcules (CSV de reports/).
+
+Lancement (2 services) :
+    1) API     : uvicorn api.main:app --port 8000
+    2) Dashboard : streamlit run dashboard/app.py
+
+    L'URL de l'API est configurable via la variable d'environnement API_URL
+    (defaut : http://localhost:8000).
 """
 
+import os
 import sys
 from pathlib import Path
 
-import joblib
 import numpy as np
 import pandas as pd
 import plotly.express as px
 import plotly.graph_objects as go
+import requests
 import streamlit as st
 
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -27,6 +38,64 @@ from src.preprocessing import (  # noqa: E402
     NUMERIC_FEATURES,
     TARGET,
 )
+
+# =============================================================================
+# CLIENT API (le dashboard appelle l'API, il ne charge aucun modele)
+# =============================================================================
+
+API_URL = os.environ.get("API_URL", "http://localhost:8000").rstrip("/")
+API_TIMEOUT = 10
+
+
+def _payload(tv, radio, sm, influencer):
+    return {"TV": tv, "Radio": radio, "Social Media": sm, "Influencer": influencer}
+
+
+@st.cache_data(ttl=20, show_spinner=False)
+def api_health():
+    """Statut du service d'inference (mis en cache 20s)."""
+    try:
+        r = requests.get(f"{API_URL}/health", timeout=5)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException as exc:
+        return {"status": "down", "model_loaded": False, "error": str(exc)}
+
+
+@st.cache_data(ttl=60, show_spinner=False)
+def api_model_info():
+    """Metadonnees du modele en production (None si l'API est injoignable)."""
+    try:
+        r = requests.get(f"{API_URL}/model-info", timeout=5)
+        r.raise_for_status()
+        return r.json()
+    except requests.exceptions.RequestException:
+        return None
+
+
+def api_predict(tv, radio, sm, influencer):
+    """Appelle POST /predict. Leve requests.exceptions.RequestException si echec."""
+    r = requests.post(f"{API_URL}/predict", json=_payload(tv, radio, sm, influencer),
+                      timeout=API_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_explain(tv, radio, sm, influencer):
+    """Appelle POST /explain. Leve requests.exceptions.RequestException si echec."""
+    r = requests.post(f"{API_URL}/explain", json=_payload(tv, radio, sm, influencer),
+                      timeout=API_TIMEOUT)
+    r.raise_for_status()
+    return r.json()
+
+
+def api_unreachable_banner():
+    """Message d'erreur homogene quand l'API ne repond pas."""
+    st.error(
+        f"**API injoignable** ({API_URL}). Cette page a besoin du service d'inference.\n\n"
+        "Demarrez l'API dans un terminal a la racine du projet :\n"
+        "```\nuvicorn api.main:app --port 8000\n```"
+    )
 
 # =============================================================================
 # CONFIG
@@ -337,13 +406,12 @@ def kpi_card(label: str, value: str, sub: str = "", color: str = "blue"):
 
 
 # =============================================================================
-# CHARGEMENT (cached)
+# CHARGEMENT (cached) — uniquement des donnees et des CSV de reports/.
+# Aucun modele n'est charge ici : les predictions passent par l'API.
 # =============================================================================
 
-MODELS_PATH    = PROJECT_ROOT / "models"
-DATA_RAW       = PROJECT_ROOT / "data" / "raw" / "marketing_and_sales.csv"
-DATA_PROCESSED = PROJECT_ROOT / "data" / "processed"
-REPORTS_PATH   = PROJECT_ROOT / "reports"
+DATA_RAW     = PROJECT_ROOT / "data" / "raw" / "marketing_and_sales.csv"
+REPORTS_PATH = PROJECT_ROOT / "reports"
 
 
 @st.cache_data
@@ -352,41 +420,18 @@ def load_raw_data():
 
 
 @st.cache_data
-def load_test_data():
-    X_test = pd.read_csv(DATA_PROCESSED / "X_test.csv")
-    y_test = pd.read_csv(DATA_PROCESSED / "y_test.csv").squeeze()
-    return X_test, y_test
-
-
-@st.cache_resource
-def load_final_model():
-    return joblib.load(MODELS_PATH / "final_model.joblib")
-
-
-@st.cache_resource
-def load_all_models():
-    return {
-        "Linear Regression":   joblib.load(MODELS_PATH / "linear_regression.joblib"),
-        "Random Forest":       joblib.load(MODELS_PATH / "random_forest.joblib"),
-        "XGBoost":             joblib.load(MODELS_PATH / "xgboost.joblib"),
-        "MLP (Deep Learning)": joblib.load(MODELS_PATH / "mlp_deep_learning.joblib"),
-    }
-
-
-@st.cache_data
 def load_evaluation_results():
     return pd.read_csv(REPORTS_PATH / "evaluation_results.csv")
 
 
-@st.cache_resource
-def get_shap_explainer(_pipeline):
-    import shap
-    return shap.TreeExplainer(_pipeline.named_steps["model"])
+@st.cache_data
+def load_test_predictions():
+    """Predictions des 4 modeles sur le test set, pre-calculees par 04_evaluation.py.
+    Permet la comparaison sans recharger aucun modele dans le dashboard."""
+    return pd.read_csv(REPORTS_PATH / "test_predictions.csv")
 
 
-df            = load_raw_data()
-X_test, y_test = load_test_data()
-pipeline      = load_final_model()
+df = load_raw_data()
 
 
 # =============================================================================
@@ -415,20 +460,46 @@ with st.sidebar:
     )
 
     st.markdown("---")
+
+    # --- Statut live de l'API d'inference -----------------------------------
+    health = api_health()
+    info = api_model_info()
+    api_online = health.get("status") == "ok"
+
+    if api_online:
+        dot, status_txt, status_col = "&#9679;", "API en ligne", "#10b981"
+    else:
+        dot, status_txt, status_col = "&#9679;", "API hors ligne", "#e74c3c"
+
+    st.markdown(
+        f'<div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;'
+        f'color:#94a3b8;margin-bottom:0.4rem;">Service d\'inference</div>'
+        f'<div class="sidebar-stat" style="display:flex;align-items:center;gap:0.5rem;">'
+        f'<span style="color:{status_col};font-size:1rem;line-height:1;">{dot}</span>'
+        f'<span class="s-value" style="font-size:0.82rem;">{status_txt}</span></div>'
+        f'<div style="font-size:0.65rem;color:#64748b;margin:0.1rem 0 0.6rem 0.1rem;">{API_URL}</div>',
+        unsafe_allow_html=True,
+    )
+
+    # Metriques issues de l'API (/model-info), avec repli si l'API est coupee.
+    algo = info["name"] if info else "XGBoost Regressor"
+    r2 = f'{info["r2_test"]:.4f}' if info else "0.9985"
+    mape = f'{info["mape_test_pct"]:.2f} %' if info else "1.84 %"
+
     st.markdown('<div style="font-size:0.7rem;text-transform:uppercase;letter-spacing:0.08em;color:#94a3b8;margin-bottom:0.5rem;">Modele en production</div>', unsafe_allow_html=True)
 
     st.markdown(f"""
     <div class="sidebar-stat">
         <div class="s-label">Algorithme</div>
-        <div class="s-value">XGBoost Regressor</div>
+        <div class="s-value">{algo}</div>
     </div>
     <div class="sidebar-stat">
         <div class="s-label">R² (test)</div>
-        <div class="s-value">0.9985</div>
+        <div class="s-value">{r2}</div>
     </div>
     <div class="sidebar-stat">
         <div class="s-label">MAPE (test)</div>
-        <div class="s-value">1.84 %</div>
+        <div class="s-value">{mape}</div>
     </div>
     <div class="sidebar-stat">
         <div class="s-label">Taille dataset</div>
@@ -719,12 +790,15 @@ elif page == "Simulation budgetaire":
         st.markdown('</div>', unsafe_allow_html=True)
 
     with col_out:
-        scenario = pd.DataFrame([{
-            "TV": tv_budget, "Radio": radio_budget,
-            "Social Media": sm_budget, "Influencer": influencer_type,
-        }])
-        prediction      = float(pipeline.predict(scenario)[0])
-        roi             = prediction / total_budget if total_budget > 0 else 0
+        # Prediction obtenue via l'API (et non via un modele charge localement)
+        try:
+            result = api_predict(tv_budget, radio_budget, sm_budget, influencer_type)
+        except requests.exceptions.RequestException:
+            api_unreachable_banner()
+            st.stop()
+
+        prediction      = result["predicted_sales_M"]
+        roi             = result["roi_estimated"]
         avg_sales_ds    = df["Sales"].mean()
         ecart_pct       = (prediction - avg_sales_ds) / avg_sales_ds * 100
         ecart_sign      = "+" if ecart_pct >= 0 else ""
@@ -905,17 +979,18 @@ elif page == "Comparaison des modeles":
         st.plotly_chart(fig, use_container_width=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
-    # Predictions vs Realite superposees
+    # Predictions vs Realite superposees (predictions pre-calculees, aucun modele charge)
     st.markdown('<div class="section-card"><div class="section-title">Predictions vs Ventes reelles — 4 modeles (test set)</div>', unsafe_allow_html=True)
-    all_models = load_all_models()
+    preds_df = load_test_predictions()
+    y_true = preds_df["y_true"]
+    model_cols = [c for c in preds_df.columns if c != "y_true"]
     fig = go.Figure()
-    for name, model in all_models.items():
-        y_pred = model.predict(X_test)
+    for name in model_cols:
         fig.add_trace(go.Scatter(
-            x=y_test, y=y_pred, mode="markers", name=name,
+            x=y_true, y=preds_df[name], mode="markers", name=name,
             marker=dict(size=5, opacity=0.45, color=MODEL_COLORS.get(name, BLUE_MED)),
         ))
-    lims = [float(y_test.min()), float(y_test.max())]
+    lims = [float(y_true.min()), float(y_true.max())]
     fig.add_trace(go.Scatter(
         x=lims, y=lims, mode="lines", name="Prediction parfaite",
         line=dict(color=RED, dash="dash", width=2),
@@ -1019,27 +1094,20 @@ elif page == "Explication SHAP":
         inf_s = st.selectbox("Influencer", INFLUENCER_CATEGORIES, index=2, key="shap_inf")
 
     with col_shap:
-        import shap
+        # Decomposition SHAP obtenue via l'API (POST /explain) : le dashboard ne
+        # construit aucun explainer ni ne charge le modele.
+        try:
+            exp = api_explain(tv_s, rad_s, sm_s, inf_s)
+        except requests.exceptions.RequestException:
+            api_unreachable_banner()
+            st.stop()
 
-        scenario = pd.DataFrame([{
-            "TV": tv_s, "Radio": rad_s, "Social Media": sm_s, "Influencer": inf_s,
-        }])
-        pred_shap = float(pipeline.predict(scenario)[0])
+        pred_shap    = exp["predicted_sales_M"]
+        expected_val = exp["base_value_M"]
 
-        preprocessor   = pipeline.named_steps["preprocessor"]
-        feature_names  = preprocessor.get_feature_names_out().tolist()
-        explainer      = get_shap_explainer(pipeline)
-        scen_tr        = preprocessor.transform(scenario)
-        shap_vals      = explainer.shap_values(scen_tr)
-        expected_val   = float(explainer.expected_value)
-        if not np.isscalar(expected_val):
-            expected_val = float(expected_val[0])
-
-        contrib = pd.DataFrame({
-            "feature":    feature_names,
-            "shap_value": shap_vals[0],
-            "abs_value":  np.abs(shap_vals[0]),
-        }).sort_values("abs_value", ascending=True)
+        contrib = pd.DataFrame(exp["contributions"])        # colonnes : feature, shap_value
+        contrib["abs_value"] = contrib["shap_value"].abs()
+        contrib = contrib.sort_values("abs_value", ascending=True)
         contrib = contrib[contrib["abs_value"] > 0.001]
 
         bar_colors = [GREEN if v > 0 else RED for v in contrib["shap_value"]]

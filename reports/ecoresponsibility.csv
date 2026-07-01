@@ -1,0 +1,6 @@
+Model,Time_sec,Energy_Wh,CO2_France_g,CO2_World_g,Car_km_eq
+XGBoost,1.79,0.0224,0.0013,0.0106,9e-05
+Linear Regression,2.66,0.0333,0.0019,0.0158,0.00013
+MLP (Deep Learning),5.5,0.0688,0.0039,0.0327,0.00027
+Random Forest,29.96,0.3745,0.021,0.1779,0.00148
+TOTAL,39.91,0.499,0.0281,0.237,0.00197

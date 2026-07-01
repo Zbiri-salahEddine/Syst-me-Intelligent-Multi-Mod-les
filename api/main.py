@@ -6,6 +6,7 @@ Service d'inference FastAPI exposant le modele XGBoost en production.
 Endpoints :
   GET  /health    -> statut du service et du modele
   POST /predict   -> prediction de ventes pour un scenario budgetaire
+  POST /explain   -> decomposition SHAP locale d'une prediction
   GET  /model-info -> informations sur le modele en production
 
 Lancement :
@@ -38,11 +39,12 @@ MODELS_PATH = PROJECT_ROOT / "models"
 REPORTS_PATH = PROJECT_ROOT / "reports"
 
 _pipeline = None
+_explainer = None          # SHAP TreeExplainer (construit une fois au demarrage)
 _model_metadata: dict = {}
 
 
 def _load_pipeline():
-    global _pipeline, _model_metadata
+    global _pipeline, _explainer, _model_metadata
     model_path = MODELS_PATH / "final_model.joblib"
     if not model_path.exists():
         raise RuntimeError(
@@ -50,6 +52,17 @@ def _load_pipeline():
             "Lancez d'abord notebooks/03_modeling.py et 04_evaluation.py."
         )
     _pipeline = joblib.load(model_path)
+
+    # Explainer SHAP construit une seule fois (le modele final XGBoost est un
+    # modele a base d'arbres -> TreeExplainer, rapide et exact).
+    # En cas d'echec (modele non arborescent), l'API reste fonctionnelle :
+    # /predict marche toujours, seul /explain renverra 503.
+    try:
+        import shap
+        _explainer = shap.TreeExplainer(_pipeline.named_steps["model"])
+    except Exception as exc:  # noqa: BLE001
+        _explainer = None
+        print(f"[warn] Explainer SHAP indisponible : {exc}")
 
     # Lecture des metriques depuis le CSV d'evaluation
     eval_path = REPORTS_PATH / "evaluation_results.csv"
@@ -141,6 +154,24 @@ class PredictResponse(BaseModel):
     total_budget_M: float = Field(description="Budget total en millions $")
     model_used: str = Field(description="Nom du modele utilise")
     input_received: dict = Field(description="Donnees d'entree recues (verification)")
+
+
+class FeatureContribution(BaseModel):
+    """Contribution SHAP d'une variable a une prediction."""
+
+    feature: str = Field(description="Nom de la variable (apres preprocessing)")
+    shap_value: float = Field(description="Contribution a la prediction, en millions $")
+
+
+class ExplainResponse(BaseModel):
+    """Decomposition SHAP locale d'une prediction."""
+
+    predicted_sales_M: float = Field(description="Ventes predites en millions $")
+    base_value_M: float = Field(description="Valeur de base (esperance du modele) en millions $")
+    total_budget_M: float = Field(description="Budget total en millions $")
+    contributions: list[FeatureContribution] = Field(
+        description="Contribution SHAP de chaque variable (somme + base = prediction)"
+    )
 
 
 class HealthResponse(BaseModel):
@@ -260,4 +291,69 @@ def predict(request: PredictRequest):
             "Social Media": request.Social_Media,
             "Influencer": request.Influencer,
         },
+    )
+
+
+@app.post(
+    "/explain",
+    response_model=ExplainResponse,
+    summary="Explication SHAP d'une prediction",
+    tags=["Inference"],
+)
+def explain(request: PredictRequest):
+    """
+    Decompose une prediction variable par variable avec SHAP (vue locale).
+
+    Memes entrees que `/predict`. Retourne, pour le scenario demande :
+    - la prediction et la valeur de base du modele,
+    - la contribution (positive ou negative, en millions $) de chaque variable.
+
+    La somme des contributions + la valeur de base reconstitue la prediction.
+    C'est ce endpoint qu'appelle le dashboard pour tracer le graphe waterfall.
+    """
+    if _pipeline is None:
+        raise HTTPException(status_code=503, detail="Modele non charge. Verifiez les logs.")
+    if _explainer is None:
+        raise HTTPException(
+            status_code=503,
+            detail="Explainer SHAP non disponible pour ce modele.",
+        )
+
+    input_df = pd.DataFrame([{
+        "TV": request.TV,
+        "Radio": request.Radio,
+        "Social Media": request.Social_Media,
+        "Influencer": request.Influencer,
+    }])
+
+    try:
+        preprocessor = _pipeline.named_steps["preprocessor"]
+        feature_names = preprocessor.get_feature_names_out().tolist()
+        transformed = preprocessor.transform(input_df)
+
+        shap_values = _explainer.shap_values(transformed)
+        base_value = _explainer.expected_value
+        if not np.isscalar(base_value):
+            base_value = float(np.asarray(base_value).ravel()[0])
+        else:
+            base_value = float(base_value)
+
+        predicted_sales = float(_pipeline.predict(input_df)[0])
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(
+            status_code=500,
+            detail=f"Erreur lors de l'explication : {str(e)}",
+        )
+
+    contributions = [
+        FeatureContribution(feature=name, shap_value=round(float(val), 6))
+        for name, val in zip(feature_names, np.asarray(shap_values).ravel())
+    ]
+    total_budget = request.TV + request.Radio + request.Social_Media
+
+    return ExplainResponse(
+        predicted_sales_M=round(predicted_sales, 4),
+        base_value_M=round(base_value, 4),
+        total_budget_M=round(total_budget, 4),
+        contributions=contributions,
     )
